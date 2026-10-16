@@ -7,6 +7,7 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.3",
     "@testing-library/user-event": "^13.5.0",
+    "@vladmandic/face-api": "^1.7.15",
     "firebase": "^12.19.0",
     "onnxruntime-web": "^1.30.0",
     "react": "^19.3.0",

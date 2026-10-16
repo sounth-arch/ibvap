@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState } from "react";
 import * as ort from "onnxruntime-web";
 import Tesseract from "tesseract.js";
+import * as faceapi from "@vladmandic/face-api";
 import { saveEventToFirestore } from "./firebase";
 
 const CLASS_NAMES = [
@@ -31,8 +32,17 @@ const LOITER_THRESHOLD_SECONDS = 10;
 const LOITER_MOVEMENT_RADIUS = 80;
 
 const OCR_COOLDOWN_MS = 4000;
+const CAMERA_TIMEOUT_MS = 3000;
 
-const CAMERA_TIMEOUT_MS = 3000; // no new frame data for this long = OFFLINE
+// ---- Face recognition settings ----
+const FACE_MODEL_URL = "/face-models";
+const FACE_CROP_HEIGHT_RATIO = 0.4;   // use the top 40% of a person's box (where the face is)
+const FACE_MIN_CROP_PX = 60;          // skip people too small/far away for a usable face
+const FACE_COOLDOWN_MS = 2500;        // wait between face attempts on the same person
+const FACE_MAX_ATTEMPTS = 6;          // give up on a track after this many failed attempts
+const FACE_DETECTION_SCORE = 0.6;     // minimum face-detector confidence
+const FACE_MATCH_THRESHOLD = 0.55;    // lower = stricter matching (0.6 is the library default)
+const SAVE_FACE_SNAPSHOTS = false;    // true = store face crops in Firestore (privacy risk)
 
 function computeIoU(boxA, boxB) {
   const ax1 = boxA.x - boxA.w / 2;
@@ -101,6 +111,9 @@ function matchTracks(existingTracks, newBoxes, nextIdRef) {
         firstSeenPosition: track.firstSeenPosition,
         lastOcrTime: track.lastOcrTime,
         plateText: track.plateText,
+        identity: track.identity,
+        lastFaceTime: track.lastFaceTime,
+        faceAttempts: track.faceAttempts,
       });
       usedBoxes.add(bestMatch);
     } else if (track.missedFrames < MAX_MISSED_FRAMES) {
@@ -118,6 +131,9 @@ function matchTracks(existingTracks, newBoxes, nextIdRef) {
         firstSeenPosition: { x: box.x, y: box.y },
         lastOcrTime: 0,
         plateText: null,
+        identity: null,
+        lastFaceTime: 0,
+        faceAttempts: 0,
       };
       updatedTracks.push(newTrack);
       nextIdRef.current += 1;
@@ -146,7 +162,7 @@ function playAlertSound(freq = 880) {
     oscillator.start();
     oscillator.stop(audioCtx.currentTime + 0.3);
   } catch (err) {
-    console.error("Could not play alert sound: - App.js:149", err);
+    console.error("Could not play alert sound: - App.js:165", err);
   }
 }
 
@@ -154,7 +170,26 @@ function cleanPlateText(raw) {
   return raw.toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
 }
 
-function createEvent(type, track, extraDetails = {}, canvasForSnapshot = null) {
+// Builds a small snapshot: the actual video frame with the boxes drawn on top
+function captureSnapshot(video, overlayCanvas) {
+  try {
+    if (!video || video.videoWidth === 0) return null;
+    const w = 320;
+    const h = Math.round((w * video.videoHeight) / video.videoWidth);
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    const cx = c.getContext("2d");
+    cx.drawImage(video, 0, 0, w, h);
+    if (overlayCanvas) cx.drawImage(overlayCanvas, 0, 0, w, h);
+    return c.toDataURL("image/jpeg", 0.6);
+  } catch (err) {
+    console.error("Snapshot error: - App.js:187", err);
+    return null;
+  }
+}
+
+function createEvent(type, track, extraDetails = {}, snapshot = null) {
   const now = Date.now();
   const event = {
     id: `evt_${now}_${Math.random().toString(36).slice(2, 8)}`,
@@ -165,11 +200,30 @@ function createEvent(type, track, extraDetails = {}, canvasForSnapshot = null) {
     timestamp: now,
     timeDisplay: new Date(now).toLocaleTimeString(),
     confidence: track.score || 0,
-    snapshot: canvasForSnapshot ? canvasForSnapshot.toDataURL("image/jpeg", 0.5) : null,
+    snapshot,
     details: extraDetails,
   };
   saveEventToFirestore(event);
   return event;
+}
+
+function faceDistance(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d * d;
+  }
+  return Math.sqrt(sum);
+}
+
+function matchFace(descriptor, enrolledList) {
+  let best = { name: null, distance: Infinity };
+  enrolledList.forEach((person) => {
+    const d = faceDistance(descriptor, person.descriptor);
+    if (d < best.distance) best = { name: person.name, distance: d };
+  });
+  if (best.distance < FACE_MATCH_THRESHOLD) return best;
+  return { name: null, distance: best.distance };
 }
 
 function App() {
@@ -178,6 +232,8 @@ function App() {
   const containerRef = useRef(null);
   const processingCanvasRef = useRef(null);
   const plateCanvasRef = useRef(null);
+  const faceCanvasRef = useRef(null);
+  const fileInputRef = useRef(null);
   const [session, setSession] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -186,6 +242,8 @@ function App() {
   const nextIdRef = useRef(1);
   const detectingRef = useRef(false);
   const ocrBusyRef = useRef(false);
+  const faceBusyRef = useRef(false);
+  const facesReadyRef = useRef(false);
   const animationRef = useRef(null);
   const timerRef = useRef(null);
   const lastVideoTimeRef = useRef(0);
@@ -204,13 +262,28 @@ function App() {
   const [events, setEvents] = useState([]);
   const [alertFlash, setAlertFlash] = useState(false);
 
-  // Camera status
   const [cameraStatus, setCameraStatus] = useState("CONNECTING");
   const lastFrameUpdateRef = useRef(Date.now());
-
-  // Dashboard tabs
   const [activeTab, setActiveTab] = useState("live");
 
+  // ---- Face recognition state ----
+  const [facesReady, setFacesReady] = useState(false);
+  const [faceError, setFaceError] = useState("");
+  const enrolledRef = useRef([]);
+  const [enrolled, setEnrolled] = useState(() => {
+    try {
+      const saved = localStorage.getItem("ibvap_faces");
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [enrollName, setEnrollName] = useState("");
+  const [enrollMsg, setEnrollMsg] = useState("");
+  const faceStatsRef = useRef({ attempts: 0, found: 0 });
+  const [faceStats, setFaceStats] = useState({ attempts: 0, found: 0 });
+
+  // Load YOLO
   useEffect(() => {
     let cancelled = false;
     async function loadModel() {
@@ -220,7 +293,7 @@ function App() {
         if (cancelled) return;
         setSession(loadedSession);
       } catch (err) {
-        console.error("MODEL ERROR: - App.js:223", err);
+        console.error("MODEL ERROR: - App.js:296", err);
         setError("Could not load YOLO model.");
       } finally {
         if (!cancelled) setLoading(false);
@@ -230,23 +303,55 @@ function App() {
     return () => { cancelled = true; };
   }, []);
 
+  // Load face models
+  useEffect(() => {
+    let cancelled = false;
+    async function loadFaceModels() {
+      try {
+        try {
+          if (faceapi.tf && faceapi.tf.ready) await faceapi.tf.ready();
+        } catch (e) {
+          console.warn("TF ready warning: - App.js:314", e);
+        }
+        await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
+        await faceapi.nets.faceLandmark68Net.loadFromUri(FACE_MODEL_URL);
+        await faceapi.nets.faceRecognitionNet.loadFromUri(FACE_MODEL_URL);
+        if (cancelled) return;
+        facesReadyRef.current = true;
+        setFacesReady(true);
+      } catch (err) {
+        console.error("FACE MODEL ERROR: - App.js:323", err);
+        setFaceError("Could not load face models. Check public/face-models.");
+      }
+    }
+    loadFaceModels();
+    return () => { cancelled = true; };
+  }, []);
+
   useEffect(() => {
     zoneRef.current = zone;
   }, [zone]);
 
-  // Camera status watchdog — checks every second whether frames are still updating
+  // Keep enrolled faces in a ref (for the detection loop) and in localStorage
+  useEffect(() => {
+    enrolledRef.current = enrolled;
+    try {
+      localStorage.setItem("ibvap_faces", JSON.stringify(enrolled));
+    } catch (err) {
+      console.error("Could not save faces: - App.js:341", err);
+    }
+  }, [enrolled]);
+
+  // Camera status watchdog
   useEffect(() => {
     const watchdog = setInterval(() => {
       const sinceLastFrame = Date.now() - lastFrameUpdateRef.current;
-      if (sinceLastFrame > CAMERA_TIMEOUT_MS) {
-        setCameraStatus("OFFLINE");
-      } else {
-        setCameraStatus("ONLINE");
-      }
+      setCameraStatus(sinceLastFrame > CAMERA_TIMEOUT_MS ? "OFFLINE" : "ONLINE");
     }, 1000);
     return () => clearInterval(watchdog);
   }, []);
 
+  // Main detection loop
   useEffect(() => {
     if (!session) return;
     const video = videoRef.current;
@@ -262,6 +367,9 @@ function App() {
 
     const plateCanvas = document.createElement("canvas");
     plateCanvasRef.current = plateCanvas;
+
+    const faceCanvas = document.createElement("canvas");
+    faceCanvasRef.current = faceCanvas;
 
     function setupCanvas() {
       if (video.videoWidth === 0 || video.videoHeight === 0) return;
@@ -321,20 +429,111 @@ function App() {
         const result = await Tesseract.recognize(dataUrl, "eng");
         const cleaned = cleanPlateText(result.data.text);
 
-        if (cleaned.length >= 4) {
-          track.plateText = cleaned;
+        // Write the result onto the CURRENT version of this track (not the stale copy)
+        const live = tracksRef.current.find((t) => t.id === track.id);
+        if (cleaned.length >= 4 && live) {
+          live.plateText = cleaned;
           const event = createEvent(
             "ANPR",
-            track,
+            live,
             { plateText: cleaned, ocrConfidence: result.data.confidence },
-            canvasRef.current
+            captureSnapshot(video, canvas)
           );
           setEvents((prev) => [event, ...prev].slice(0, 100));
         }
       } catch (err) {
-        console.error("OCR ERROR: - App.js:335", err);
+        console.error("OCR ERROR: - App.js:445", err);
       } finally {
         ocrBusyRef.current = false;
+      }
+    }
+
+    async function runFaceCheck(track) {
+      if (faceBusyRef.current || !facesReadyRef.current) return;
+      faceBusyRef.current = true;
+
+      try {
+        const scaleX = video.videoWidth / INPUT_SIZE;
+        const scaleY = video.videoHeight / INPUT_SIZE;
+
+        const boxX = Math.max(0, (track.x - track.w / 2) * scaleX);
+        const boxY = Math.max(0, (track.y - track.h / 2) * scaleY);
+        const boxW = Math.min(track.w * scaleX, video.videoWidth - boxX);
+        const boxH = Math.min(
+          track.h * scaleY * FACE_CROP_HEIGHT_RATIO,
+          video.videoHeight - boxY
+        );
+
+        // Too small/far away to contain a usable face: skip (not counted as an attempt)
+        if (boxW < FACE_MIN_CROP_PX || boxH < FACE_MIN_CROP_PX) return;
+
+        const fc = faceCanvasRef.current;
+        fc.width = boxW;
+        fc.height = boxH;
+        fc.getContext("2d").drawImage(video, boxX, boxY, boxW, boxH, 0, 0, boxW, boxH);
+
+        const result = await faceapi
+          .detectSingleFace(
+            fc,
+            new faceapi.TinyFaceDetectorOptions({
+              inputSize: 320,
+              scoreThreshold: FACE_DETECTION_SCORE,
+            })
+          )
+          .withFaceLandmarks()
+          .withFaceDescriptor();
+
+        faceStatsRef.current.attempts += 1;
+
+        const live = tracksRef.current.find((t) => t.id === track.id);
+        if (!live) {
+          setFaceStats({ ...faceStatsRef.current });
+          return;
+        }
+
+        if (!result) {
+          live.faceAttempts = (live.faceAttempts || 0) + 1;
+          setFaceStats({ ...faceStatsRef.current });
+          return;
+        }
+
+        faceStatsRef.current.found += 1;
+        setFaceStats({ ...faceStatsRef.current });
+
+        const list = enrolledRef.current;
+        let type;
+        let details;
+
+        if (list.length === 0) {
+          type = "FACE_DETECTED";
+          details = {};
+          live.identity = "Face";
+        } else {
+          const m = matchFace(result.descriptor, list);
+          if (m.name) {
+            type = "KNOWN_FACE";
+            details = { name: m.name, distance: Number(m.distance.toFixed(2)) };
+            live.identity = m.name;
+          } else {
+            type = "UNKNOWN_FACE";
+            details = { distance: Number(m.distance.toFixed(2)) };
+            live.identity = "Unknown";
+          }
+        }
+
+        const snapshot = SAVE_FACE_SNAPSHOTS ? fc.toDataURL("image/jpeg", 0.7) : null;
+        const event = createEvent(
+          type,
+          { ...live, score: result.detection.score },
+          details,
+          snapshot
+        );
+        setEvents((prev) => [event, ...prev].slice(0, 100));
+        if (type === "UNKNOWN_FACE") playAlertSound(660);
+      } catch (err) {
+        console.error("FACE ERROR: - App.js:534", err);
+      } finally {
+        faceBusyRef.current = false;
       }
     }
 
@@ -346,7 +545,7 @@ function App() {
       detectingRef.current = true;
       lastFrameUpdateRef.current = Date.now();
 
-      // ---- FIX 1: Detect video loop and reset tracker cleanly ----
+      // Reset the tracker cleanly when the video loops
       const currentVideoTime = video.currentTime;
       const looped = currentVideoTime < lastVideoTimeRef.current - 0.5;
       lastVideoTimeRef.current = currentVideoTime;
@@ -358,7 +557,6 @@ function App() {
         detectingRef.current = false;
         return;
       }
-      // ---------------------------------------------------------------
 
       try {
         processingCtx.drawImage(video, 0, 0, INPUT_SIZE, INPUT_SIZE);
@@ -418,7 +616,12 @@ function App() {
 
           const oldStatus = oldStatusMap.get(track.id) || {};
           if (inside && !oldStatus.isInside) {
-            const event = createEvent("INTRUSION", track, { zone: currentZone }, canvas);
+            const event = createEvent(
+              "INTRUSION",
+              track,
+              { zone: currentZone },
+              captureSnapshot(video, canvas)
+            );
             newEventsBatch.push(event);
           }
 
@@ -438,9 +641,21 @@ function App() {
                 "LOITERING",
                 track,
                 { durationSeconds: Math.round(elapsedSeconds) },
-                canvas
+                captureSnapshot(video, canvas)
               );
               newEventsBatch.push(event);
+            }
+
+            // Face check for people we haven't identified yet
+            if (
+              !track.identity &&
+              (track.faceAttempts || 0) < FACE_MAX_ATTEMPTS &&
+              now - (track.lastFaceTime || 0) > FACE_COOLDOWN_MS &&
+              !faceBusyRef.current &&
+              facesReadyRef.current
+            ) {
+              track.lastFaceTime = now;
+              runFaceCheck(track);
             }
           } else {
             track.isLoitering = false;
@@ -470,7 +685,7 @@ function App() {
           }
         }
       } catch (err) {
-        console.error("DETECTION ERROR: - App.js:473", err);
+        console.error("DETECTION ERROR: - App.js:688", err);
       } finally {
         detectingRef.current = false;
       }
@@ -500,6 +715,7 @@ function App() {
     };
   }, [session]);
 
+  // ---- Zone drawing ----
   function getRelativePoint(e) {
     const rect = containerRef.current.getBoundingClientRect();
     const px = e.clientX - rect.left;
@@ -541,7 +757,7 @@ function App() {
     try {
       localStorage.setItem("ibvap_zone", JSON.stringify(newZone));
     } catch (err) {
-      console.error("Could not save zone: - App.js:544", err);
+      console.error("Could not save zone: - App.js:760", err);
     }
     drawStartRef.current = null;
     setDrawingRect(null);
@@ -553,14 +769,74 @@ function App() {
     localStorage.removeItem("ibvap_zone");
   }
 
-  // ---- FIX 4: Statistics, computed from events ----
+  // ---- Face enrollment ----
+  async function handleEnroll() {
+    const file = fileInputRef.current && fileInputRef.current.files[0];
+    const name = enrollName.trim();
+
+    if (!facesReady) {
+      setEnrollMsg("Face models are still loading. Try again in a moment.");
+      return;
+    }
+    if (!name) {
+      setEnrollMsg("Type a name first.");
+      return;
+    }
+    if (!file) {
+      setEnrollMsg("Choose a photo first.");
+      return;
+    }
+
+    setEnrollMsg("Processing photo...");
+    try {
+      const img = await faceapi.bufferToImage(file);
+      const result = await faceapi
+        .detectSingleFace(
+          img,
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 })
+        )
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+
+      if (!result) {
+        setEnrollMsg("No face found in that photo. Try a clearer, front-facing one.");
+        return;
+      }
+
+      const entry = { name, descriptor: Array.from(result.descriptor) };
+      setEnrolled((prev) => [...prev, entry]);
+      setEnrollMsg(`Enrolled a photo for ${name}.`);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    } catch (err) {
+      console.error("ENROLL ERROR: - App.js:811", err);
+      setEnrollMsg("Something went wrong reading that photo.");
+    }
+  }
+
+  function removePerson(name) {
+    setEnrolled((prev) => prev.filter((p) => p.name !== name));
+  }
+
+  const enrolledSummary = Object.entries(
+    enrolled.reduce((acc, p) => {
+      acc[p.name] = (acc[p.name] || 0) + 1;
+      return acc;
+    }, {})
+  );
+
+  // ---- Statistics ----
   const stats = {
     total: events.length,
     intrusions: events.filter((e) => e.type === "INTRUSION").length,
     loitering: events.filter((e) => e.type === "LOITERING").length,
     anpr: events.filter((e) => e.type === "ANPR").length,
+    knownFaces: events.filter((e) => e.type === "KNOWN_FACE").length,
+    unknownFaces: events.filter((e) => e.type === "UNKNOWN_FACE").length,
     activeTracks: tracks.length,
-    uniquePlates: [...new Set(events.filter((e) => e.type === "ANPR").map((e) => e.details.plateText))].length,
+    uniquePlates: [
+      ...new Set(events.filter((e) => e.type === "ANPR").map((e) => e.details.plateText)),
+    ].length,
+    enrolledPeople: enrolledSummary.length,
   };
 
   const tabButtonStyle = (tab) => ({
@@ -573,6 +849,15 @@ function App() {
     color: activeTab === tab ? "#007bff" : "#555",
     cursor: "pointer",
   });
+
+  const panelStyle = {
+    marginTop: "20px",
+    width: "100%",
+    maxWidth: "900px",
+    padding: "15px",
+    border: "1px solid #ccc",
+    borderRadius: "8px",
+  };
 
   return (
     <div style={{ padding: "20px", fontFamily: "Arial" }}>
@@ -588,7 +873,6 @@ function App() {
         </div>
       )}
 
-      {/* ---- FIX 2: Camera status bar ---- */}
       <div style={{
         display: "flex", alignItems: "center", gap: "10px",
         padding: "10px", marginBottom: "10px", borderRadius: "6px",
@@ -604,7 +888,6 @@ function App() {
         {error && ` — ${error}`}
       </div>
 
-      {/* ---- FIX 3: Dashboard tabs ---- */}
       <div style={{ display: "flex", borderBottom: "1px solid #ccc", marginBottom: "15px" }}>
         <button style={tabButtonStyle("live")} onClick={() => setActiveTab("live")}>Live View</button>
         <button style={tabButtonStyle("history")} onClick={() => setActiveTab("history")}>Event History</button>
@@ -710,13 +993,60 @@ function App() {
                     zIndex: 10,
                   }}
                 >
-                  #{track.id}{track.isLoitering ? " ⏱" : ""}{track.plateText ? ` ${track.plateText}` : ""}
+                  #{track.id}
+                  {track.isLoitering ? " ⏱" : ""}
+                  {track.plateText ? ` ${track.plateText}` : ""}
+                  {track.identity ? ` 👤${track.identity}` : ""}
                 </div>
               );
             })}
           </div>
 
-          <div style={{ marginTop: "20px", width: "100%", maxWidth: "900px", padding: "15px", border: "1px solid #ccc", borderRadius: "8px" }}>
+          {/* ---- Face recognition panel ---- */}
+          <div style={panelStyle}>
+            <h3>Face Recognition</h3>
+            <p style={{ fontSize: "13px", color: faceError ? "red" : facesReady ? "green" : "orange" }}>
+              {faceError ? faceError : facesReady ? "✓ Face models loaded" : "Loading face models..."}
+            </p>
+            <p style={{ fontSize: "12px", color: "#777" }}>
+              Only enroll people who have agreed to it. Face data stays in this browser.
+            </p>
+
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginBottom: "8px" }}>
+              <input
+                type="text"
+                placeholder="Person's name"
+                value={enrollName}
+                onChange={(e) => setEnrollName(e.target.value)}
+                style={{ padding: "6px" }}
+              />
+              <input type="file" accept="image/*" ref={fileInputRef} />
+              <button onClick={handleEnroll} style={{ padding: "6px 12px" }}>Enroll photo</button>
+            </div>
+            {enrollMsg && <p style={{ fontSize: "13px" }}>{enrollMsg}</p>}
+
+            <div style={{ marginTop: "8px" }}>
+              <strong>Enrolled people ({enrolledSummary.length})</strong>
+              {enrolledSummary.length === 0 ? (
+                <p style={{ fontSize: "13px" }}>
+                  No one enrolled yet. Faces will be logged as "FACE_DETECTED" until you enroll someone.
+                </p>
+              ) : (
+                enrolledSummary.map(([name, count]) => (
+                  <div key={name} style={{ padding: "4px 0", fontSize: "14px" }}>
+                    👤 {name} — {count} photo{count > 1 ? "s" : ""}{" "}
+                    <button onClick={() => removePerson(name)} style={{ marginLeft: "8px" }}>Remove</button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <p style={{ fontSize: "12px", color: "#555", marginTop: "10px" }}>
+              Face checks run: {faceStats.attempts} · Faces found: {faceStats.found}
+            </p>
+          </div>
+
+          <div style={panelStyle}>
             <h3>Active Tracking IDs ({tracks.length})</h3>
             {tracks.length === 0 ? (
               <p>No objects detected.</p>
@@ -737,6 +1067,7 @@ function App() {
                     if (track.isInside) { status = "🚨 Inside Zone"; rowBg = "#ffcccc"; }
                     else if (track.isLoitering) { status = "⏱ Loitering"; rowBg = "#fff3cd"; }
                     if (track.plateText) status += ` | 🚗 ${track.plateText}`;
+                    if (track.identity) status += ` | 👤 ${track.identity}`;
 
                     return (
                       <tr key={track.id} style={{ background: rowBg, borderBottom: "1px solid #ddd" }}>
@@ -782,6 +1113,9 @@ function App() {
                   if (event.type === "INTRUSION") rowColor = "#ffe5e5";
                   else if (event.type === "LOITERING") rowColor = "#fff3cd";
                   else if (event.type === "ANPR") rowColor = "#e5f3ff";
+                  else if (event.type === "KNOWN_FACE") rowColor = "#e5ffe5";
+                  else if (event.type === "UNKNOWN_FACE") rowColor = "#f3e5ff";
+                  else if (event.type === "FACE_DETECTED") rowColor = "#eef6ee";
 
                   return (
                     <tr key={event.id} style={{ background: idx % 2 === 0 ? rowColor : "#fff", borderBottom: "1px solid #ddd" }}>
@@ -819,6 +1153,9 @@ function App() {
             { label: "Loitering Events", value: stats.loitering, color: "#f1c40f" },
             { label: "Plates Read (ANPR)", value: stats.anpr, color: "#3498db" },
             { label: "Unique Plates", value: stats.uniquePlates, color: "#3498db" },
+            { label: "Known Faces", value: stats.knownFaces, color: "#27ae60" },
+            { label: "Unknown Faces", value: stats.unknownFaces, color: "#8e44ad" },
+            { label: "Enrolled People", value: stats.enrolledPeople, color: "#27ae60" },
             { label: "Currently Active Tracks", value: stats.activeTracks, color: "#2ecc71" },
           ].map((card) => (
             <div key={card.label} style={{
