@@ -36,12 +36,13 @@ const CAMERA_TIMEOUT_MS = 3000;
 
 // ---- Face recognition settings ----
 const FACE_MODEL_URL = "/face-models";
-const FACE_CROP_HEIGHT_RATIO = 0.4;   // use the top 40% of a person's box (where the face is)
-const FACE_MIN_CROP_PX = 60;          // skip people too small/far away for a usable face
-const FACE_COOLDOWN_MS = 2500;        // wait between face attempts on the same person
-const FACE_MAX_ATTEMPTS = 6;          // give up on a track after this many failed attempts
-const FACE_DETECTION_SCORE = 0.6;     // minimum face-detector confidence
-const FACE_MATCH_THRESHOLD = 0.55;    // lower = stricter matching (0.6 is the library default)
+const FACE_CROP_HEIGHT_RATIO = 0.5;   // use the top 50% of a person's box (where the face is)
+const FACE_MIN_CROP_PX = 40;          // skip people too small/far away for a usable face
+const FACE_COOLDOWN_MS = 1500;        // wait between face attempts on the same person
+const FACE_MAX_ATTEMPTS = 15;         // give up on a track after this many "no face found" attempts
+const FACE_DETECTION_SCORE = 0.4;     // minimum face-detector confidence
+const FACE_MATCH_THRESHOLD = 0.6;     // lower = stricter matching
+const FACE_UNKNOWN_AFTER = 3;         // failed matches before someone is called "Unknown"
 const SAVE_FACE_SNAPSHOTS = false;    // true = store face crops in Firestore (privacy risk)
 
 function computeIoU(boxA, boxB) {
@@ -114,6 +115,7 @@ function matchTracks(existingTracks, newBoxes, nextIdRef) {
         identity: track.identity,
         lastFaceTime: track.lastFaceTime,
         faceAttempts: track.faceAttempts,
+        faceMisses: track.faceMisses,
       });
       usedBoxes.add(bestMatch);
     } else if (track.missedFrames < MAX_MISSED_FRAMES) {
@@ -134,6 +136,7 @@ function matchTracks(existingTracks, newBoxes, nextIdRef) {
         identity: null,
         lastFaceTime: 0,
         faceAttempts: 0,
+        faceMisses: 0,
       };
       updatedTracks.push(newTrack);
       nextIdRef.current += 1;
@@ -162,7 +165,7 @@ function playAlertSound(freq = 880) {
     oscillator.start();
     oscillator.stop(audioCtx.currentTime + 0.3);
   } catch (err) {
-    console.error("Could not play alert sound: - App.js:165", err);
+    console.error("Could not play alert sound: - App.js:168", err);
   }
 }
 
@@ -184,7 +187,7 @@ function captureSnapshot(video, overlayCanvas) {
     if (overlayCanvas) cx.drawImage(overlayCanvas, 0, 0, w, h);
     return c.toDataURL("image/jpeg", 0.6);
   } catch (err) {
-    console.error("Snapshot error: - App.js:187", err);
+    console.error("Snapshot error: - App.js:190", err);
     return null;
   }
 }
@@ -266,6 +269,11 @@ function App() {
   const lastFrameUpdateRef = useRef(Date.now());
   const [activeTab, setActiveTab] = useState("live");
 
+  // Which video is selected (remembered in this browser address)
+  const [videoSrc] = useState(
+    () => localStorage.getItem("ibvap_video") || "/sample.mp4"
+  );
+
   // ---- Face recognition state ----
   const [facesReady, setFacesReady] = useState(false);
   const [faceError, setFaceError] = useState("");
@@ -282,6 +290,7 @@ function App() {
   const [enrollMsg, setEnrollMsg] = useState("");
   const faceStatsRef = useRef({ attempts: 0, found: 0 });
   const [faceStats, setFaceStats] = useState({ attempts: 0, found: 0 });
+  const [lastFace, setLastFace] = useState("No face check yet");
 
   // Load YOLO
   useEffect(() => {
@@ -293,7 +302,7 @@ function App() {
         if (cancelled) return;
         setSession(loadedSession);
       } catch (err) {
-        console.error("MODEL ERROR: - App.js:296", err);
+        console.error("MODEL ERROR: - App.js:305", err);
         setError("Could not load YOLO model.");
       } finally {
         if (!cancelled) setLoading(false);
@@ -311,7 +320,7 @@ function App() {
         try {
           if (faceapi.tf && faceapi.tf.ready) await faceapi.tf.ready();
         } catch (e) {
-          console.warn("TF ready warning: - App.js:314", e);
+          console.warn("TF ready warning: - App.js:323", e);
         }
         await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
         await faceapi.nets.faceLandmark68Net.loadFromUri(FACE_MODEL_URL);
@@ -320,7 +329,7 @@ function App() {
         facesReadyRef.current = true;
         setFacesReady(true);
       } catch (err) {
-        console.error("FACE MODEL ERROR: - App.js:323", err);
+        console.error("FACE MODEL ERROR: - App.js:332", err);
         setFaceError("Could not load face models. Check public/face-models.");
       }
     }
@@ -338,7 +347,7 @@ function App() {
     try {
       localStorage.setItem("ibvap_faces", JSON.stringify(enrolled));
     } catch (err) {
-      console.error("Could not save faces: - App.js:341", err);
+      console.error("Could not save faces: - App.js:350", err);
     }
   }, [enrolled]);
 
@@ -429,7 +438,6 @@ function App() {
         const result = await Tesseract.recognize(dataUrl, "eng");
         const cleaned = cleanPlateText(result.data.text);
 
-        // Write the result onto the CURRENT version of this track (not the stale copy)
         const live = tracksRef.current.find((t) => t.id === track.id);
         if (cleaned.length >= 4 && live) {
           live.plateText = cleaned;
@@ -442,7 +450,7 @@ function App() {
           setEvents((prev) => [event, ...prev].slice(0, 100));
         }
       } catch (err) {
-        console.error("OCR ERROR: - App.js:445", err);
+        console.error("OCR ERROR: - App.js:453", err);
       } finally {
         ocrBusyRef.current = false;
       }
@@ -464,8 +472,15 @@ function App() {
           video.videoHeight - boxY
         );
 
-        // Too small/far away to contain a usable face: skip (not counted as an attempt)
-        if (boxW < FACE_MIN_CROP_PX || boxH < FACE_MIN_CROP_PX) return;
+        // Too small/far away to contain a usable face: skip
+        if (boxW < FACE_MIN_CROP_PX || boxH < FACE_MIN_CROP_PX) {
+          setLastFace((prev) =>
+            prev === "No face check yet" || prev.includes("too small")
+              ? `Track #${track.id}: person too small for a face check (${Math.round(boxW)}x${Math.round(boxH)} px, needs ${FACE_MIN_CROP_PX})`
+              : prev
+          );
+          return;
+        }
 
         const fc = faceCanvasRef.current;
         fc.width = boxW;
@@ -494,44 +509,62 @@ function App() {
         if (!result) {
           live.faceAttempts = (live.faceAttempts || 0) + 1;
           setFaceStats({ ...faceStatsRef.current });
+          setLastFace(
+            `Track #${track.id}: no face found in the head area (${Math.round(boxW)}x${Math.round(boxH)} px)`
+          );
           return;
         }
 
         faceStatsRef.current.found += 1;
         setFaceStats({ ...faceStatsRef.current });
 
-        const list = enrolledRef.current;
-        let type;
-        let details;
+        const logFace = (type, details) => {
+          const snapshot = SAVE_FACE_SNAPSHOTS ? fc.toDataURL("image/jpeg", 0.7) : null;
+          const event = createEvent(
+            type,
+            { ...live, score: result.detection.score },
+            details,
+            snapshot
+          );
+          setEvents((prev) => [event, ...prev].slice(0, 100));
+        };
 
+        const list = enrolledRef.current;
+
+        // Nobody enrolled yet: just log that a face was seen
         if (list.length === 0) {
-          type = "FACE_DETECTED";
-          details = {};
           live.identity = "Face";
-        } else {
-          const m = matchFace(result.descriptor, list);
-          if (m.name) {
-            type = "KNOWN_FACE";
-            details = { name: m.name, distance: Number(m.distance.toFixed(2)) };
-            live.identity = m.name;
-          } else {
-            type = "UNKNOWN_FACE";
-            details = { distance: Number(m.distance.toFixed(2)) };
-            live.identity = "Unknown";
-          }
+          setLastFace(`Track #${track.id}: face found, but nobody is enrolled yet`);
+          logFace("FACE_DETECTED", {});
+          return;
         }
 
-        const snapshot = SAVE_FACE_SNAPSHOTS ? fc.toDataURL("image/jpeg", 0.7) : null;
-        const event = createEvent(
-          type,
-          { ...live, score: result.detection.score },
-          details,
-          snapshot
+        const m = matchFace(result.descriptor, list);
+
+        // Recognised: lock in the name
+        if (m.name) {
+          live.identity = m.name;
+          setLastFace(`Track #${track.id}: MATCH ${m.name} (distance ${m.distance.toFixed(2)})`);
+          logFace("KNOWN_FACE", {
+            name: m.name,
+            distance: Number(m.distance.toFixed(2)),
+          });
+          return;
+        }
+
+        // Not recognised: try a few more times before calling the person Unknown
+        live.faceMisses = (live.faceMisses || 0) + 1;
+        setLastFace(
+          `Track #${track.id}: no match (distance ${m.distance.toFixed(2)}, must be below ${FACE_MATCH_THRESHOLD}), try ${live.faceMisses} of ${FACE_UNKNOWN_AFTER}`
         );
-        setEvents((prev) => [event, ...prev].slice(0, 100));
-        if (type === "UNKNOWN_FACE") playAlertSound(660);
+        if (live.faceMisses >= FACE_UNKNOWN_AFTER) {
+          live.identity = "Unknown";
+          logFace("UNKNOWN_FACE", { distance: Number(m.distance.toFixed(2)) });
+          playAlertSound(660);
+        }
       } catch (err) {
-        console.error("FACE ERROR: - App.js:534", err);
+        console.error("FACE ERROR: - App.js:566", err);
+        setLastFace(`Error while checking face: ${err.message || err}`);
       } finally {
         faceBusyRef.current = false;
       }
@@ -685,7 +718,7 @@ function App() {
           }
         }
       } catch (err) {
-        console.error("DETECTION ERROR: - App.js:688", err);
+        console.error("DETECTION ERROR: - App.js:721", err);
       } finally {
         detectingRef.current = false;
       }
@@ -757,7 +790,7 @@ function App() {
     try {
       localStorage.setItem("ibvap_zone", JSON.stringify(newZone));
     } catch (err) {
-      console.error("Could not save zone: - App.js:760", err);
+      console.error("Could not save zone: - App.js:793", err);
     }
     drawStartRef.current = null;
     setDrawingRect(null);
@@ -808,7 +841,7 @@ function App() {
       setEnrollMsg(`Enrolled a photo for ${name}.`);
       if (fileInputRef.current) fileInputRef.current.value = "";
     } catch (err) {
-      console.error("ENROLL ERROR: - App.js:811", err);
+      console.error("ENROLL ERROR: - App.js:844", err);
       setEnrollMsg("Something went wrong reading that photo.");
     }
   }
@@ -912,6 +945,18 @@ function App() {
           <button onClick={clearZone} style={{ marginBottom: "10px", padding: "6px 12px" }}>
             Clear Zone
           </button>
+          <br />
+          <select
+            value={videoSrc}
+            onChange={(e) => {
+              localStorage.setItem("ibvap_video", e.target.value);
+              window.location.reload();
+            }}
+            style={{ marginBottom: "10px", padding: "6px" }}
+          >
+            <option value="/sample.mp4">Street clip (sample.mp4)</option>
+            <option value="/face-test.mp4">Face test (face-test.mp4)</option>
+          </select>
 
           <div
             ref={containerRef}
@@ -923,7 +968,7 @@ function App() {
           >
             <video
               ref={videoRef}
-              src="/sample.mp4"
+              src={videoSrc}
               controls
               autoPlay
               muted
@@ -1043,6 +1088,9 @@ function App() {
 
             <p style={{ fontSize: "12px", color: "#555", marginTop: "10px" }}>
               Face checks run: {faceStats.attempts} · Faces found: {faceStats.found}
+            </p>
+            <p style={{ fontSize: "13px", fontWeight: "bold" }}>
+              Last result: {lastFace}
             </p>
           </div>
 
